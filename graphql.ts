@@ -517,6 +517,7 @@ function resolveField(source: Tagged, field: string, args: Record<string, unknow
         const found = itemByGlobalId(forge, input.issueId, 'Issue');
         if (found === null) throw new Error('issue not found');
         (found.item as IssueRec).state = 'closed';
+        forge.touch();
         return tag('CloseIssuePayload', { issue: issueTag(found.repo, found.item as IssueRec) });
       }
       if (field === 'createPullRequest') {

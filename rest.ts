@@ -5,6 +5,7 @@
 import {
   VIEWER,
   commentsOf,
+  invalidateRepoCaches,
   commentView,
   isoOfSec,
   issueView,
@@ -38,6 +39,8 @@ export interface RestResult {
   headers?: Record<string, string>;
   /** True for a 204: no body at all. */
   empty?: boolean;
+  /** Pre-serialized body bytes (the exact JSON text plus its newline); wins over `body`. */
+  raw?: Buffer;
 }
 
 function ok(status: number, body: unknown, headers?: Record<string, string>): RestResult {
@@ -125,11 +128,12 @@ export function mergePull(forge: Forge, repo: RepoRec, pull: PullRec, method: st
   const commitData = buildCommit(outcome.treeSha, parents, line, line, `${message}\n`);
   const sha = storeObject(repo, 'commit', commitData);
   repo.refs.set(`refs/heads/${pull.baseRef}`, sha);
-  repo.packCache.clear();
+  invalidateRepoCaches(repo);
   pull.state = 'closed';
   pull.merged = true;
   pull.mergeCommitSha = sha;
   pull.mergedSeq = forge.clockSeq;
+  forge.touch();
   return { ok: true, sha };
 }
 
@@ -180,7 +184,7 @@ function writeContents(forge: Forge, repo: RepoRec, branch: string, path: string
   const commitData = buildCommit(treeSha, parents, line, line, `${message}\n`);
   const commitSha = storeObject(repo, 'commit', commitData);
   repo.refs.set(refName, commitSha);
-  repo.packCache.clear();
+  invalidateRepoCaches(repo);
   return { status: existing === undefined ? 201 : 200, commitSha, blobSha, created: existing === undefined };
 }
 
@@ -206,8 +210,27 @@ function deleteContents(forge: Forge, repo: RepoRec, branch: string, path: strin
   const commitData = buildCommit(treeSha, [tipCommit], line, line, `${message}\n`);
   const commitSha = storeObject(repo, 'commit', commitData);
   repo.refs.set(refName, commitSha);
-  repo.packCache.clear();
+  invalidateRepoCaches(repo);
   return { commitSha };
+}
+
+/**
+ * The single-item read shared by /issues/{number} (which also serves pull requests): the
+ * rendered view is a pure function of the item, its labels and its comment count, all stamped
+ * by the forge's store version, so a version match replays the exact serialized bytes.
+ */
+export function getItemResult(forge: Forge, repo: RepoRec, number: number): RestResult {
+  const item = repo.items.get(number);
+  if (item === undefined) return NOT_FOUND;
+  const cached = repo.itemViewCache.get(number);
+  if (cached !== undefined && cached.version === forge.storeVersion) {
+    return { status: 200, body: null, raw: cached.body };
+  }
+  const view = item.kind === 'issue' ? issueView(forge, repo, item) : pullView(forge, item);
+  const raw = Buffer.from(`${JSON.stringify(view)}\n`, 'utf8');
+  if (repo.itemViewCache.size > 256) repo.itemViewCache.clear();
+  repo.itemViewCache.set(number, { version: forge.storeVersion, body: raw });
+  return { status: 200, body: null, raw };
 }
 
 // ---------------------------------------------------------------- the router
@@ -314,7 +337,7 @@ export function routeRest(forge: Forge, request: RestRequest): RestResult {
         const sha = typeof body.sha === 'string' ? body.sha : '';
         if (ref === '' || !repo.objects.has(sha)) return fail(422, 'Validation Failed: ref and a known sha are required');
         repo.refs.set(ref, sha);
-        repo.packCache.clear();
+        invalidateRepoCaches(repo);
         return ok(201, { ref, object: { sha, type: repo.objects.get(sha)?.type ?? 'commit' } });
       }
       return NOT_FOUND;
@@ -432,6 +455,7 @@ export function routeRest(forge: Forge, request: RestRequest): RestResult {
       if (repo.labels.has(name)) return fail(422, 'Validation Failed: name has already been taken');
       const label = { name, color: typeof body.color === 'string' ? body.color.replace(/^#/, '') : 'ededed', description: typeof body.description === 'string' ? body.description : null };
       repo.labels.set(name, label);
+      forge.touch();
       return ok(201, labelView(label));
     }
     if (rest.length === 1 && method === 'GET') {
@@ -475,11 +499,14 @@ export function routeRest(forge: Forge, request: RestRequest): RestResult {
     if (rest.length === 2) {
       if (item === undefined) return NOT_FOUND;
       if (method === 'GET') {
-        return ok(200, item.kind === 'issue' ? issueView(forge, repo, item) : pullView(forge, item));
+        return getItemResult(forge, repo, number);
       }
       if (method === 'PATCH' && item.kind === 'issue') {
         if (request.bodyMalformed) return fail(400, 'Problems parsing JSON');
         const body = asRecord(request.body);
+        // The fields below are assigned before the label validation can refuse the request, so
+        // the mutation marker goes first: any exit from here may already have changed the item.
+        forge.touch();
         if (typeof body.title === 'string') item.title = body.title;
         if (typeof body.body === 'string') item.body = body.body;
         if (body.state === 'open' || body.state === 'closed') item.state = body.state;

@@ -5,6 +5,7 @@
 // sequential counter, so an identical sequence of requests produces identical responses.
 
 import { createHash } from 'node:crypto';
+import type { FetchPlan } from './git.ts';
 
 /** The token's owner: every repository in the store belongs to this login. */
 export const VIEWER = {
@@ -129,7 +130,20 @@ export interface RepoRec {
   items: Map<number, ItemRec>;
   nextNumber: number;
   seq: number;
-  packCache: Map<string, Buffer>;
+  packCache: Map<string, FetchPlan>;
+  /** Framed ls-refs answers, keyed by the request's argument lines. */
+  lsRefsCache: Map<string, Buffer>;
+  /** Rendered single-item REST views, keyed by item number, stamped with the forge's store version. */
+  itemViewCache: Map<number, { version: number; body: Buffer }>;
+}
+
+/**
+ * Drop every derived-byte cache of a repository. The fetch plans and ls-refs answers are pure
+ * functions of the repository's objects and refs, so every mutation of either calls this.
+ */
+export function invalidateRepoCaches(repo: RepoRec): void {
+  repo.packCache.clear();
+  repo.lsRefsCache.clear();
 }
 
 // ---------------------------------------------------------------- the forge
@@ -142,6 +156,12 @@ export class Forge {
   nextItemId: number;
   nextCommentId: number;
   requestSeq: number;
+  /**
+   * A monotone counter bumped by every mutation that can change a rendered item view (an issue
+   * or pull field, its labels, its comment count). Cached views carry the version they were
+   * rendered at; a mismatch re-renders. Pure bookkeeping: it never reaches a response.
+   */
+  storeVersion: number;
 
   constructor() {
     this.repos = new Map();
@@ -150,6 +170,12 @@ export class Forge {
     this.nextItemId = 1;
     this.nextCommentId = 1;
     this.requestSeq = 0;
+    this.storeVersion = 0;
+  }
+
+  /** Record a mutation that can change rendered item views (see storeVersion). */
+  touch(): void {
+    this.storeVersion += 1;
   }
 
   /** Advance the logical clock and return the new epoch second. */
@@ -191,6 +217,8 @@ export class Forge {
       nextNumber: 1,
       seq: this.clockSeq,
       packCache: new Map(),
+      lsRefsCache: new Map(),
+      itemViewCache: new Map(),
     };
     this.nextRepoId += 1;
     this.repos.set(name, repo);
@@ -266,19 +294,24 @@ export class Forge {
     const comment: CommentRec = { id: this.nextCommentId, body, seq: this.clockSeq };
     this.nextCommentId += 1;
     item.comments.push(comment);
+    this.touch();
     return comment;
   }
 }
 
 // ---------------------------------------------------------------- shared views
 
+/** The viewer's REST object: one shared instance (views are only ever serialized, never mutated). */
+const USER_VIEW: Record<string, unknown> = { login: VIEWER.login, id: VIEWER.id, type: VIEWER.type, name: VIEWER.name, email: VIEWER.email };
+
 /** The viewer's REST object (also the shape of every `user` field). */
 export function userView(): Record<string, unknown> {
-  return { login: VIEWER.login, id: VIEWER.id, type: VIEWER.type, name: VIEWER.name, email: VIEWER.email };
+  return USER_VIEW;
 }
 
 /** The REST repository object. */
 export function repoView(forge: Forge, repo: RepoRec): Record<string, unknown> {
+  const timestamp = forge.isoOfSeq(repo.seq);
   return {
     id: repo.id,
     name: repo.name,
@@ -287,8 +320,8 @@ export function repoView(forge: Forge, repo: RepoRec): Record<string, unknown> {
     description: repo.description,
     default_branch: repo.defaultBranch,
     owner: userView(),
-    created_at: forge.isoOfSeq(repo.seq),
-    updated_at: forge.isoOfSeq(repo.seq),
+    created_at: timestamp,
+    updated_at: timestamp,
   };
 }
 
@@ -299,6 +332,7 @@ export function labelView(label: LabelRec): Record<string, unknown> {
 
 /** The REST issue object. */
 export function issueView(forge: Forge, repo: RepoRec, issue: IssueRec): Record<string, unknown> {
+  const timestamp = forge.isoOfSeq(issue.seq);
   return {
     id: issue.id,
     number: issue.number,
@@ -311,8 +345,8 @@ export function issueView(forge: Forge, repo: RepoRec, issue: IssueRec): Record<
     }),
     user: userView(),
     comments: issue.comments.length,
-    created_at: forge.isoOfSeq(issue.seq),
-    updated_at: forge.isoOfSeq(issue.seq),
+    created_at: timestamp,
+    updated_at: timestamp,
   };
 }
 
@@ -337,12 +371,13 @@ export function pullView(forge: Forge, pull: PullRec): Record<string, unknown> {
 
 /** The REST comment object. */
 export function commentView(forge: Forge, comment: CommentRec): Record<string, unknown> {
+  const timestamp = forge.isoOfSeq(comment.seq);
   return {
     id: comment.id,
     body: comment.body,
     user: userView(),
-    created_at: forge.isoOfSeq(comment.seq),
-    updated_at: forge.isoOfSeq(comment.seq),
+    created_at: timestamp,
+    updated_at: timestamp,
   };
 }
 

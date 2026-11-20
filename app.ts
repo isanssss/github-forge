@@ -7,12 +7,18 @@
 
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
 import { Forge } from './store.ts';
-import { routeRest, type RestResult } from './rest.ts';
+import { getItemResult, routeRest, type RestResult } from './rest.ts';
 import { executeGraphQL } from './graphql.ts';
 import { handleMcp } from './mcp.ts';
 import { infoRefs, receivePack, uploadPack } from './git.ts';
 
 const JSON_TYPE = 'application/json; charset=utf-8';
+
+/** The query of every queryless request: shared, because the router only ever reads it. */
+const EMPTY_QUERY = new URLSearchParams();
+
+/** The expected Authorization header for the configured token, rebuilt only when the token changes. */
+let authHeaderCache: { token: string; header: string } | null = null;
 
 /** Whether the request carries the viewer's credential. */
 function authorized(req: IncomingMessage): boolean {
@@ -20,19 +26,22 @@ function authorized(req: IncomingMessage): boolean {
   if (typeof header !== 'string' || header === '') return false;
   const token = process.env.MAKEFUN_SHOP_TOKEN ?? '';
   if (token === '') return true;
-  return header === `Bearer ${token}`;
+  if (authHeaderCache === null || authHeaderCache.token !== token) {
+    authHeaderCache = { token, header: `Bearer ${token}` };
+  }
+  return header === authHeaderCache.header;
 }
 
 /** Answer with a JSON body and the forge's request-id header. */
-function sendJson(forge: Forge, res: ServerResponse, status: number, body: unknown, headers: Record<string, string> = {}): void {
-  const text = `${JSON.stringify(body)}\n`;
+function sendJson(forge: Forge, res: ServerResponse, status: number, body: unknown, headers: Record<string, string> = {}, raw?: Buffer): void {
+  const bytes = raw ?? Buffer.from(`${JSON.stringify(body)}\n`, 'utf8');
   res.writeHead(status, {
     'content-type': JSON_TYPE,
-    'content-length': Buffer.byteLength(text),
+    'content-length': bytes.length,
     'x-github-request-id': forge.nextRequestId(),
     ...headers,
   });
-  res.end(text);
+  res.end(bytes);
 }
 
 /** Answer with raw bytes (the git transport). */
@@ -53,6 +62,7 @@ function readBody(req: IncomingMessage): Promise<Buffer> {
 
 /** Decode one URL path segment (a malformed escape reads as the raw segment). */
 function decodeSegment(segment: string): string {
+  if (!segment.includes('%')) return segment;
   try {
     return decodeURIComponent(segment);
   } catch {
@@ -60,10 +70,29 @@ function decodeSegment(segment: string): string {
   }
 }
 
+/** One query parameter's value from a raw query string, or null when the name is absent. */
+function queryParam(query: string, name: string): string | null {
+  let start = 0;
+  while (start <= query.length) {
+    let end = query.indexOf('&', start);
+    if (end === -1) end = query.length;
+    if (query.startsWith(`${name}=`, start)) {
+      const value = query.slice(start + name.length + 1, end);
+      // The plain values this router reads (a git service name) carry no escapes; anything
+      // escaped goes through the full form parser, which decodes exactly as before.
+      if (!value.includes('%') && !value.includes('+')) return value;
+      return new URLSearchParams(query).get(name);
+    }
+    if (end === query.length) break;
+    start = end + 1;
+  }
+  return null;
+}
+
 /** Build the server. It binds nothing until the caller listens. */
 export function createApp(): Server {
   const forge = new Forge();
-  return createServer((req: IncomingMessage, res: ServerResponse) => {
+  const server = createServer((req: IncomingMessage, res: ServerResponse) => {
     void (async (): Promise<void> => {
       try {
         await dispatch(forge, req, res);
@@ -80,57 +109,26 @@ export function createApp(): Server {
       }
     })();
   });
+  // Small request/response exchanges dominate the workload: never let Nagle hold a reply back.
+  server.on('connection', (socket) => {
+    socket.setNoDelay(true);
+  });
+  return server;
 }
 
 /** Route one request to its surface. */
 async function dispatch(forge: Forge, req: IncomingMessage, res: ServerResponse): Promise<void> {
   const method = req.method ?? 'GET';
-  let url: URL;
-  try {
-    url = new URL(req.url ?? '/', 'http://entry');
-  } catch {
-    sendJson(forge, res, 400, { message: 'Bad Request' });
-    return;
-  }
-  const path = url.pathname;
+  // The request target arrives in origin form ("/path?query"): split it by hand rather than
+  // paying for a full URL parse on every request.
+  const target = req.url ?? '/';
+  const queryAt = target.indexOf('?');
+  const path = queryAt === -1 ? target : target.slice(0, queryAt);
+  const query = queryAt === -1 ? '' : target.slice(queryAt + 1);
 
   // The env's boot probe: no auth, no body.
   if (method === 'GET' && path === '/healthz') {
     sendJson(forge, res, 200, { ok: true });
-    return;
-  }
-
-  // Git smart HTTP at /{owner}/{repo}.git/...
-  const gitMatch = /^\/([^/]+)\/([^/]+)\.git(\/.*)?$/.exec(path);
-  if (gitMatch !== null) {
-    const owner = decodeSegment(gitMatch[1]!);
-    const repoName = decodeSegment(gitMatch[2]!);
-    const sub = gitMatch[3] ?? '';
-    const repo = forge.getRepo(owner, repoName);
-    if (repo === null) {
-      sendJson(forge, res, 404, { message: 'Not Found' });
-      return;
-    }
-    const protocolHeader = req.headers['git-protocol'];
-    const protocol = Array.isArray(protocolHeader) ? protocolHeader[0] ?? null : protocolHeader ?? null;
-    if (method === 'GET' && sub === '/info/refs') {
-      const result = infoRefs(repo, url.searchParams.get('service') ?? '', protocol);
-      sendBytes(res, result.status, result.contentType, result.body);
-      return;
-    }
-    if (method === 'POST' && sub === '/git-upload-pack') {
-      const body = await readBody(req);
-      const result = uploadPack(repo, body, protocol);
-      sendBytes(res, result.status, result.contentType, result.body);
-      return;
-    }
-    if (method === 'POST' && sub === '/git-receive-pack') {
-      const body = await readBody(req);
-      const result = receivePack(forge, repo, body);
-      sendBytes(res, result.status, result.contentType, result.body);
-      return;
-    }
-    sendJson(forge, res, 404, { message: 'Not Found' });
     return;
   }
 
@@ -184,6 +182,21 @@ async function dispatch(forge: Forge, req: IncomingMessage, res: ServerResponse)
       sendJson(forge, res, 401, { message: 'Requires authentication' });
       return;
     }
+    // The hot read: one issue or pull request with no query string. Anything encoded,
+    // queried or otherwise unusual falls through to the general router below.
+    if (method === 'GET' && query === '') {
+      const fast = /^\/api\/v3\/repos\/([^/%]+)\/([^/%]+)\/issues\/(\d+)$/.exec(path);
+      if (fast !== null) {
+        const repo = forge.getRepo(fast[1]!, fast[2]!);
+        if (repo === null) {
+          sendJson(forge, res, 404, { message: 'Not Found' });
+          return;
+        }
+        const result = getItemResult(forge, repo, Number(fast[3]));
+        sendJson(forge, res, result.status, result.body, {}, result.raw);
+        return;
+      }
+    }
     let body: unknown = undefined;
     let bodyMalformed = false;
     if (method === 'POST' || method === 'PUT' || method === 'PATCH' || method === 'DELETE') {
@@ -200,15 +213,14 @@ async function dispatch(forge: Forge, req: IncomingMessage, res: ServerResponse)
       sendJson(forge, res, 400, { message: 'Problems parsing JSON' });
       return;
     }
-    const segments = path
-      .slice('/api/v3'.length)
-      .split('/')
-      .filter((segment) => segment !== '')
-      .map(decodeSegment);
+    const segments: string[] = [];
+    for (const part of path.slice('/api/v3'.length).split('/')) {
+      if (part !== '') segments.push(decodeSegment(part));
+    }
     const result: RestResult = routeRest(forge, {
       method,
       segments,
-      query: url.searchParams,
+      query: query === '' ? EMPTY_QUERY : new URLSearchParams(query),
       host: req.headers.host ?? 'entry',
       path,
       body,
@@ -219,7 +231,41 @@ async function dispatch(forge: Forge, req: IncomingMessage, res: ServerResponse)
       res.end();
       return;
     }
-    sendJson(forge, res, result.status, result.body, result.headers ?? {});
+    sendJson(forge, res, result.status, result.body, result.headers ?? {}, result.raw);
+    return;
+  }
+
+  // Git smart HTTP at /{owner}/{repo}.git/...
+  const gitMatch = /^\/([^/]+)\/([^/]+)\.git(\/.*)?$/.exec(path);
+  if (gitMatch !== null) {
+    const owner = decodeSegment(gitMatch[1]!);
+    const repoName = decodeSegment(gitMatch[2]!);
+    const sub = gitMatch[3] ?? '';
+    const repo = forge.getRepo(owner, repoName);
+    if (repo === null) {
+      sendJson(forge, res, 404, { message: 'Not Found' });
+      return;
+    }
+    const protocolHeader = req.headers['git-protocol'];
+    const protocol = Array.isArray(protocolHeader) ? protocolHeader[0] ?? null : protocolHeader ?? null;
+    if (method === 'GET' && sub === '/info/refs') {
+      const result = infoRefs(repo, queryParam(query, 'service') ?? '', protocol);
+      sendBytes(res, result.status, result.contentType, result.body);
+      return;
+    }
+    if (method === 'POST' && sub === '/git-upload-pack') {
+      const body = await readBody(req);
+      const result = uploadPack(repo, body, protocol);
+      sendBytes(res, result.status, result.contentType, result.body);
+      return;
+    }
+    if (method === 'POST' && sub === '/git-receive-pack') {
+      const body = await readBody(req);
+      const result = receivePack(forge, repo, body);
+      sendBytes(res, result.status, result.contentType, result.body);
+      return;
+    }
+    sendJson(forge, res, 404, { message: 'Not Found' });
     return;
   }
 

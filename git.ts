@@ -5,7 +5,7 @@
 
 import { createHash } from 'node:crypto';
 import { deflateSync, inflateSync } from 'node:zlib';
-import { VIEWER, ZERO_OID, type Forge, type GitObject, type RepoRec } from './store.ts';
+import { VIEWER, ZERO_OID, invalidateRepoCaches, type Forge, type GitObject, type RepoRec } from './store.ts';
 
 // ---------------------------------------------------------------- object primitives
 
@@ -36,18 +36,32 @@ export interface CommitInfo {
 export function parseCommit(data: Buffer): CommitInfo {
   const text = data.toString('utf8');
   const split = text.indexOf('\n\n');
-  const head = split === -1 ? text : text.slice(0, split);
+  const headEnd = split === -1 ? text.length : split;
   const message = split === -1 ? '' : text.slice(split + 2);
   let tree = ZERO_OID;
   const parents: string[] = [];
   let time = 0;
-  for (const line of head.split('\n')) {
-    if (line.startsWith('tree ')) tree = line.slice(5).trim();
-    else if (line.startsWith('parent ')) parents.push(line.slice(7).trim());
-    else if (line.startsWith('committer ')) {
-      const match = / (\d+) [+-]\d{4}$/.exec(line);
-      if (match !== null) time = Number(match[1]);
+  let pos = 0;
+  while (pos < headEnd) {
+    let nl = text.indexOf('\n', pos);
+    if (nl === -1 || nl > headEnd) nl = headEnd;
+    if (text.startsWith('tree ', pos)) {
+      tree = text.slice(pos + 5, nl).trim();
+    } else if (text.startsWith('parent ', pos)) {
+      parents.push(text.slice(pos + 7, nl).trim());
+    } else if (text.startsWith('committer ', pos)) {
+      // The line ends "<timestamp> <sign><tz>": the timestamp sits between the last two spaces,
+      // and the final token must be a signed four-digit zone, as the timestamp grammar requires.
+      const tzSpace = text.lastIndexOf(' ', nl - 1);
+      if (tzSpace > pos && /^[+-]\d{4}$/.test(text.slice(tzSpace + 1, nl))) {
+        const tsSpace = text.lastIndexOf(' ', tzSpace - 1);
+        if (tsSpace > pos) {
+          const stamp = text.slice(tsSpace + 1, tzSpace);
+          if (/^\d+$/.test(stamp)) time = Number(stamp);
+        }
+      }
     }
+    pos = nl + 1;
   }
   return { tree, parents, message, time };
 }
@@ -346,6 +360,8 @@ function applyDelta(base: Buffer, delta: Buffer): Buffer {
 
 export interface ParsedPack {
   objects: GitObject[];
+  /** The object id of each entry of `objects` (same order), computed during the parse. */
+  oids: string[];
   consumed: number;
 }
 
@@ -358,6 +374,7 @@ export function readPack(repo: RepoRec, buf: Buffer, offset: number): ParsedPack
   const count = buf.readUInt32BE(offset + 8);
   let pos = offset + 12;
   const byOffset = new Map<number, GitObject>();
+  const byOffsetOid = new Map<number, string>();
   const bySha = new Map<string, GitObject>();
   const pending: Array<{ start: number; kind: 'ofs' | 'ref'; baseOffset: number; baseSha: string; delta: Buffer }> = [];
 
@@ -401,8 +418,10 @@ export function readPack(repo: RepoRec, buf: Buffer, offset: number): ParsedPack
       const inflated = inflateSync(buf.subarray(pos), { info: true }) as unknown as { buffer: Buffer; engine: { bytesWritten: number } };
       pos += inflated.engine.bytesWritten;
       const object: GitObject = { type, data: inflated.buffer };
+      const oid = hashObject(type, inflated.buffer);
       byOffset.set(start, object);
-      bySha.set(hashObject(type, inflated.buffer), object);
+      byOffsetOid.set(start, oid);
+      bySha.set(oid, object);
     }
   }
 
@@ -421,8 +440,10 @@ export function readPack(repo: RepoRec, buf: Buffer, offset: number): ParsedPack
         continue;
       }
       const object = resolveDelta(base, entry.delta);
+      const oid = hashObject(object.type, object.data);
       byOffset.set(entry.start, object);
-      bySha.set(hashObject(object.type, object.data), object);
+      byOffsetOid.set(entry.start, oid);
+      bySha.set(oid, object);
       progressed = true;
     }
     if (!progressed) throw new Error('delta base not found');
@@ -432,7 +453,13 @@ export function readPack(repo: RepoRec, buf: Buffer, offset: number): ParsedPack
   const trailerStart = pos;
   pos += 20;
   void trailerStart;
-  return { objects: [...byOffset.values()], consumed: pos - offset };
+  const objects: GitObject[] = [];
+  const oids: string[] = [];
+  for (const [start, object] of byOffset) {
+    objects.push(object);
+    oids.push(byOffsetOid.get(start)!);
+  }
+  return { objects, oids, consumed: pos - offset };
 }
 
 /** Write a packfile holding full objects only (no deltas); the trailer is the pack's SHA-1. */
@@ -468,12 +495,19 @@ export function writePack(objects: GitObject[]): Buffer {
 
 // ---------------------------------------------------------------- pkt-lines
 
-/** One pkt-line: a 4-hex length prefix (counting itself) plus the payload. */
+const HEX_DIGITS = '0123456789abcdef';
+
+/** One pkt-line: a 4-hex length prefix (counting itself) plus the payload, in a single buffer. */
 export function pktLine(payload: Buffer | string): Buffer {
   const data = typeof payload === 'string' ? Buffer.from(payload, 'utf8') : payload;
   const length = data.length + 4;
-  const head = Buffer.from(length.toString(16).padStart(4, '0'), 'utf8');
-  return Buffer.concat([head, data]);
+  const out = Buffer.allocUnsafe(length);
+  out[0] = HEX_DIGITS.charCodeAt((length >> 12) & 15);
+  out[1] = HEX_DIGITS.charCodeAt((length >> 8) & 15);
+  out[2] = HEX_DIGITS.charCodeAt((length >> 4) & 15);
+  out[3] = HEX_DIGITS.charCodeAt(length & 15);
+  data.copy(out, 4);
+  return out;
 }
 
 export const FLUSH_PKT = Buffer.from('0000', 'utf8');
@@ -552,19 +586,23 @@ function v0Advertisement(repo: RepoRec, service: 'git-upload-pack' | 'git-receiv
   return Buffer.concat(parts);
 }
 
-/** The protocol v2 capability advertisement for upload-pack. */
+/** The protocol v2 capability advertisement for upload-pack: constant bytes, built once. */
+let v2AdvertisementCache: Buffer | null = null;
+
 function v2Advertisement(): Buffer {
-  const parts: Buffer[] = [
-    pktLine('# service=git-upload-pack\n'),
-    FLUSH_PKT,
-    pktLine('version 2\n'),
-    pktLine(`agent=${AGENT}\n`),
-    pktLine('ls-refs=unborn\n'),
-    pktLine('fetch=shallow\n'),
-    pktLine('object-format=sha1\n'),
-    FLUSH_PKT,
-  ];
-  return Buffer.concat(parts);
+  if (v2AdvertisementCache === null) {
+    v2AdvertisementCache = Buffer.concat([
+      pktLine('# service=git-upload-pack\n'),
+      FLUSH_PKT,
+      pktLine('version 2\n'),
+      pktLine(`agent=${AGENT}\n`),
+      pktLine('ls-refs=unborn\n'),
+      pktLine('fetch=shallow\n'),
+      pktLine('object-format=sha1\n'),
+      FLUSH_PKT,
+    ]);
+  }
+  return v2AdvertisementCache;
 }
 
 export interface GitHttpResult {
@@ -590,6 +628,11 @@ export function infoRefs(repo: RepoRec, service: string, protocolVersion: string
 // ---------------------------------------------------------------- ls-refs (protocol v2)
 
 function lsRefs(repo: RepoRec, args: string[]): Buffer {
+  // The answer is a pure function of the arguments and the repository's refs and objects;
+  // both are covered by the repository's cache invalidation, so a hit replays the bytes.
+  const cacheKey = args.join('\n');
+  const hit = repo.lsRefsCache.get(cacheKey);
+  if (hit !== undefined) return hit;
   let peel = false;
   let unborn = false;
   const prefixes: string[] = [];
@@ -617,7 +660,10 @@ function lsRefs(repo: RepoRec, args: string[]): Buffer {
     parts.push(pktLine(`${line}\n`));
   }
   parts.push(FLUSH_PKT);
-  return Buffer.concat(parts);
+  const body = Buffer.concat(parts);
+  if (repo.lsRefsCache.size > 64) repo.lsRefsCache.clear();
+  repo.lsRefsCache.set(cacheKey, body);
+  return body;
 }
 
 // ---------------------------------------------------------------- fetch
@@ -635,10 +681,27 @@ export interface FetchPlan {
   pack: Buffer;
   shallowLines: string[];
   hasHaves: boolean;
+  /** The framed protocol-v2 response for this plan, built on first use. */
+  v2Body?: Buffer;
+  /** The framed protocol-v0 response for this plan, built on first use. */
+  v0Body?: Buffer;
 }
 
 /** Compute what a fetch sends: the pack bytes and the shallow-info lines. */
 export function planFetch(repo: RepoRec, request: FetchRequest): FetchPlan {
+  // The plan is a pure function of the request and the repository's objects and refs, and the
+  // repository clears this cache on every mutation of either, so a hit needs no recomputation.
+  const cacheKey = [
+    [...request.wants].sort().join(','),
+    [...request.haves].sort().join(','),
+    [...request.shallow].sort().join(','),
+    request.deepen ?? '',
+    request.deepenSince ?? '',
+    request.deepenNot.join(','),
+  ].join('|');
+  const cached = repo.packCache.get(cacheKey);
+  if (cached !== undefined) return cached;
+
   const clientShallow = new Set(request.shallow);
   const clientHas = commitClosure(repo, request.haves, clientShallow);
 
@@ -759,21 +822,10 @@ export function planFetch(repo: RepoRec, request: FetchRequest): FetchPlan {
     addObject(parseCommit(object.data).tree);
   }
 
-  const cacheKey = [
-    [...request.wants].sort().join(','),
-    [...request.haves].sort().join(','),
-    [...request.shallow].sort().join(','),
-    depth ?? '',
-    request.deepenSince ?? '',
-    request.deepenNot.join(','),
-  ].join('|');
-  let pack = repo.packCache.get(cacheKey);
-  if (pack === undefined) {
-    pack = writePack([...objects.values()]);
-    if (repo.packCache.size > 64) repo.packCache.clear();
-    repo.packCache.set(cacheKey, pack);
-  }
-  return { pack, shallowLines, hasHaves: request.haves.length > 0 };
+  const plan: FetchPlan = { pack: writePack([...objects.values()]), shallowLines, hasHaves: request.haves.length > 0 };
+  if (repo.packCache.size > 64) repo.packCache.clear();
+  repo.packCache.set(cacheKey, plan);
+  return plan;
 }
 
 /** Frame pack bytes as side-band-64k pkt-lines (band 1), each within the 65520-byte limit. */
@@ -791,34 +843,34 @@ function sidebandPack(pack: Buffer): Buffer[] {
 /** A protocol v2 fetch response: sections of pkt-lines, the packfile last. */
 function fetchV2(repo: RepoRec, request: FetchRequest): Buffer {
   const plan = planFetch(repo, request);
+  if (plan.v2Body !== undefined) return plan.v2Body;
   const parts: Buffer[] = [];
-  let wroteSection = false;
   if (plan.hasHaves) {
     parts.push(pktLine('acknowledgments\n'), pktLine('NAK\n'), DELIM_PKT);
-    wroteSection = true;
   }
   if (plan.shallowLines.length > 0) {
     parts.push(pktLine('shallow-info\n'));
     for (const line of plan.shallowLines) parts.push(pktLine(`${line}\n`));
     parts.push(DELIM_PKT);
-    wroteSection = true;
   }
-  void wroteSection;
   parts.push(pktLine('packfile\n'));
   parts.push(...sidebandPack(plan.pack));
   parts.push(FLUSH_PKT);
-  return Buffer.concat(parts);
+  plan.v2Body = Buffer.concat(parts);
+  return plan.v2Body;
 }
 
 /** A protocol v0 fetch response: plain negotiation lines, then the sideband pack. */
 function fetchV0(repo: RepoRec, request: FetchRequest): Buffer {
   const plan = planFetch(repo, request);
+  if (plan.v0Body !== undefined) return plan.v0Body;
   const parts: Buffer[] = [];
   if (plan.hasHaves) parts.push(pktLine('NAK\n'));
   for (const line of plan.shallowLines) parts.push(pktLine(`${line}\n`));
   parts.push(...sidebandPack(plan.pack));
   parts.push(FLUSH_PKT);
-  return Buffer.concat(parts);
+  plan.v0Body = Buffer.concat(parts);
+  return plan.v0Body;
 }
 
 /** Parse one fetch/ls-refs argument block into a FetchRequest. */
@@ -930,9 +982,9 @@ export function receivePack(forge: Forge, repo: RepoRec, body: Buffer): GitHttpR
     if (packBytes.length > 0) {
       try {
         const parsed = readPack(repo, packBytes, 0);
-        for (const object of parsed.objects) {
-          const sha = hashObject(object.type, object.data);
-          if (!repo.objects.has(sha)) repo.objects.set(sha, object);
+        for (let index = 0; index < parsed.objects.length; index += 1) {
+          const sha = parsed.oids[index]!;
+          if (!repo.objects.has(sha)) repo.objects.set(sha, parsed.objects[index]!);
         }
       } catch (error) {
         unpackError = error instanceof Error ? error.message : 'unpack failed';
@@ -944,7 +996,7 @@ export function receivePack(forge: Forge, repo: RepoRec, body: Buffer): GitHttpR
       const failure = unpackError === null ? validateAndApply(repo, command) : 'unpacker error';
       report.push(failure === null ? `ok ${command.ref}\n` : `ng ${command.ref} ${failure}\n`);
     }
-    repo.packCache.clear();
+    invalidateRepoCaches(repo);
 
     const lines = report.map((line) => pktLine(line));
     let responseBody: Buffer;
